@@ -170,22 +170,15 @@ crear_tablas()
 
 # Helper function to escape MarkdownV2 special characters
 def escape_markdown_v2(text: str) -> str:
-    """Escapes special characters for MarkdownV2 parse mode, excluding * and _ for formatting.
+    if not text:  # Maneja None o vacío
+        return ""
     
-    The backslash '\' must be escaped first to prevent issues with other escaped characters.
-    """
-    # Escape backslash first to prevent double-escaping or issues with later escapes
     text = text.replace('\\', '\\\\')
-
-    # List of other special characters that need to be escaped
-    # Exclude '*' and '_' if they are intended for formatting (bold/italic)
-    # Based on Telegram Bot API documentation for MarkdownV2:
-    # `[`, `]`, `(`, `)`, `~`, `` ` ``, `>`, `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!`
     special_chars_to_escape = '[]()~`>#+-=|{}.!'
     for char in special_chars_to_escape:
         text = text.replace(char, f'\\{char}')
-    
     return text
+
 
 # --- Funciones para interacciones con la DB ---
 
