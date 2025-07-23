@@ -1,11 +1,14 @@
 import logging
 import sqlite3
 from datetime import datetime
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters, ContextTypes
 )
+from flask import Flask, request # Importar Flask para manejar webhooks
+import asyncio # Importar asyncio para ejecutar funciones asíncronas fuera del bucle de eventos
 
 # Configuración de logging
 logging.basicConfig(
@@ -42,10 +45,39 @@ logger = logging.getLogger(__name__)
 ) = range(54) # Actualizado a 54 para incluir los nuevos estados de modificación de propiedad
 
 # --- Variables globales ---
-TOKEN = "8143679562:AAGvdVvxIqYJBNf68qIEtSzcX3LOgaVNzk4" # Reemplaza con tu token de bot
-ADMIN_IDS = [5239904442] # Reemplaza con los IDs de Telegram de tus administradores
+# Obtener el token del bot desde las variables de entorno
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN no está configurado en las variables de entorno.")
+    # En un entorno de producción como Render, esto debería causar un fallo.
+    # Para desarrollo local, podrías poner un token de prueba aquí.
+    exit(1)
+
+# Obtener los IDs de administrador desde las variables de entorno
+ADMIN_IDS_STR = os.environ.get("ADMIN_IDS")
+if not ADMIN_IDS_STR:
+    logger.error("ADMIN_IDS no está configurado en las variables de entorno.")
+    ADMIN_IDS = [] # Valor por defecto si no está configurado
+else:
+    try:
+        ADMIN_IDS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',')]
+    except ValueError:
+        logger.error("ADMIN_IDS contiene valores no numéricos. Asegúrate de que sean una lista de números separados por comas.")
+        ADMIN_IDS = []
+
+# Configuración para webhooks
+PORT = int(os.environ.get("PORT", "5000"))
+WEBHOOK_PATH = "/webhook" # Ruta donde el bot recibirá las actualizaciones
+
+# Inicializar la aplicación Flask
+app = Flask(__name__)
 
 # --- Base de datos ---
+# NOTA IMPORTANTE: SQLite en Render.com (o en la mayoría de los servicios gratuitos sin disco persistente)
+# NO MANTENDRÁ LOS DATOS entre reinicios del servicio. Esto significa que si el bot se duerme
+# y se reinicia, o si Render.com realiza mantenimiento, la base de datos 'inquilinos.db'
+# se reseteará. Para una aplicación de producción, se recomienda usar una base de datos
+# persistente como PostgreSQL (Render.com ofrece un nivel gratuito para PostgreSQL también).
 conn = sqlite3.connect('inquilinos.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -398,6 +430,22 @@ def obtener_facturas_por_medidor_y_mes(medidor_id, year, month):
     result = cursor.fetchone()
     return (result[0] if result and result[0] is not None else 0.0,
             result[1] if result and result[1] is not None else 0.0)
+
+def obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, tipo_servicio, year, month):
+    """Obtiene la suma de las facturas y el total de kWh para una propiedad y tipo de servicio en un mes dado."""
+    cursor.execute(
+        "SELECT SUM(monto), SUM(total_kwh) FROM facturas WHERE propiedad_id = ? AND tipo_servicio = ? AND strftime('%Y-%m', fecha) = ?",
+        (propiedad_id, tipo_servicio, f"{year:04d}-{month:02d}")
+    )
+    result = cursor.fetchone()
+    return (result[0] if result and result[0] is not None else 0.0,
+            result[1] if result and result[1] is not None else 0.0)
+
+def obtener_inquilinos_prorrateo_compartido_luz(propiedad_id):
+    """Obtiene el total de personas de inquilinos que prorratean luz sin medidor individual en una propiedad."""
+    cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ? AND tipo_alquiler = 'prorrateo' AND medidor_asignado_luz_id IS NULL", (propiedad_id,))
+    result = cursor.fetchone()
+    return result[0] if result and result[0] is not None else 0
 
 # --- Teclados Inline ---
 
@@ -900,8 +948,7 @@ async def send_welcome_and_wifi_key_to_inquilino(context: ContextTypes.DEFAULT_T
     
     welcome_message += "Con este bot podrás:\n" \
                        "- Consultar tu saldo y pagos.\n" \
-                       "- Amortizar tu alquiler.\n" \
-                       "- Enviar quejas o sugerencias.\n" \
+                       "- Amortizar tu alquiler.\n" " - Enviar quejas o sugerencias.\n" \
                        "- Ver los detalles de tu propiedad.\n\n" \
                        "Usa /start para acceder a tu menú."
 
@@ -998,16 +1045,16 @@ async def inq_amortizar_comprobante(update: Update, context: ContextTypes.DEFAUL
         try:
             inquilino_nombre = inquilino[1] if inquilino else chat_id
             
-            # Botón para confirmar directamente
+            # Botón para confirmar directamente - NUEVO CALLBACK DATA
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Confirmar Pago", callback_data=f"confirmpago_{pago_id}")]
+                [InlineKeyboardButton("✅ Confirmar Pago Directo", callback_data=f"confirm_payment_direct_{pago_id}_{chat_id}_{monto_amortizar}_{saldo_despues_pago_simulado}")]
             ])
 
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=escape_markdown_v2(f"🚨 *Nuevo pago pendiente de confirmación:*\n"
-                     f"Inquilino: {escape_markdown_v2(inquilino_nombre)} (ID: {chat_id})\n"
-                     f"Monto: {monto_amortizar:.2f} Bs."),
+                         f"Inquilino: {escape_markdown_v2(inquilino_nombre)} (ID: {chat_id})\n"
+                         f"Monto: {monto_amortizar:.2f} Bs."),
                 parse_mode='MarkdownV2'
             )
             if update.message.photo:
@@ -1018,18 +1065,59 @@ async def inq_amortizar_comprobante(update: Update, context: ContextTypes.DEFAUL
                     reply_markup=keyboard, # Añadir el botón al comprobante
                     parse_mode='MarkdownV2'
                 )
-            else: # Si no hay foto, enviar el botón en un mensaje separado
-                 await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=escape_markdown_v2(f"Comprobante de pago de {escape_markdown_v2(inquilino_nombre)} para {monto_amortizar:.2f} Bs."),
-                    reply_markup=keyboard,
-                    parse_mode='MarkdownV2'
-                )
+            # No hay `else` aquí, porque si es una foto, el botón va en la foto. Si no es foto, el mensaje de arriba ya se envió.
 
         except Exception as e:
             logger.error(f"Error al notificar al admin {admin_id} sobre pago pendiente: {e}")
 
     return ConversationHandler.END
+
+# NUEVO HANDLER: Confirmar pago directamente desde la notificación
+async def admin_confirm_payment_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirma un pago directamente desde el botón de la notificación."""
+    query = update.callback_query
+    await query.answer() # Always answer the callback query
+
+    # Parse data from callback_data
+    parts = query.data.split("_")
+    pago_id = int(parts[3])
+    chat_id_inquilino = int(parts[4])
+    monto_pagado = float(parts[5])
+    saldo_real_despues_pago = float(parts[6])
+
+    # Check if payment is already confirmed
+    cursor.execute("SELECT confirmado FROM pagos WHERE id = ?", (pago_id,))
+    is_confirmed = cursor.fetchone()
+    if is_confirmed and is_confirmed[0] == 1:
+        # Send a new message to the admin, as we cannot edit the original if it was a photo caption
+        await context.bot.send_message(
+            chat_id=query.message.chat.id,
+            text=escape_markdown_v2("Este pago ya ha sido confirmado previamente."),
+            parse_mode='MarkdownV2'
+        )
+        return ConversationHandler.END
+
+    confirmar_pago_db(pago_id, chat_id_inquilino, monto_pagado, saldo_real_despues_pago)
+    
+    # Send a new message to the admin confirming the action
+    await context.bot.send_message(
+        chat_id=query.message.chat.id, # Send to the admin who clicked the button
+        text=escape_markdown_v2("✅ Pago confirmado y saldo actualizado."),
+        parse_mode='MarkdownV2'
+    )
+    
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id_inquilino,
+            text=escape_markdown_v2(f"✅ Tu pago de {monto_pagado:.2f} Bs. ha sido *confirmado* por la administración.\n"
+                 f"Tu nuevo saldo pendiente es: {saldo_real_despues_pago:.2f} Bs."),
+            parse_mode='MarkdownV2'
+        )
+    except Exception as e:
+        logger.error(f"Error al notificar al inquilino {chat_id_inquilino} sobre pago confirmado: {e}")
+    
+    return ConversationHandler.END
+
 
 async def handle_admin_confirmar_pagos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra la lista de pagos pendientes de confirmación."""
@@ -1206,6 +1294,36 @@ async def admin_mark_queja_resolved_confirm(update: Update, context: ContextType
         await query.edit_message_text(escape_markdown_v2("Operación cancelada."), reply_markup=teclado_admin_comunicacion(), parse_mode='MarkdownV2')
 
     if 'queja_a_resolver_id' in context.user_data: del context.user_data['queja_a_resolver_id']
+    return ConversationHandler.END
+
+# NUEVO HANDLER: Marcar queja como resuelta directamente desde la notificación
+async def admin_resolve_queja_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Marca una queja como resuelta directamente desde el botón de la notificación."""
+    query = update.callback_query
+    await query.answer()
+    
+    queja_id = int(query.data.split("_")[3])
+
+    # Check if queja is already resolved
+    cursor.execute("SELECT resuelto FROM quejas WHERE id = ?", (queja_id,))
+    is_resolved = cursor.fetchone()
+    if is_resolved and is_resolved[0] == 1:
+        # Send a new message to the admin, as we cannot edit the original if it was a photo caption
+        await context.bot.send_message(
+            chat_id=query.message.chat.id,
+            text=escape_markdown_v2("Esta queja ya ha sido marcada como resuelta."),
+            parse_mode='MarkdownV2'
+        )
+        return ConversationHandler.END
+
+    marcar_queja_resuelto(queja_id)
+    # Send a new message to the admin confirming the action
+    await context.bot.send_message(
+        chat_id=query.message.chat.id,
+        text=escape_markdown_v2(f"✅ Queja ID {queja_id} marcada como resuelta."),
+        parse_mode='MarkdownV2'
+    )
+    
     return ConversationHandler.END
 
 
@@ -2243,7 +2361,8 @@ async def admin_generar_cobro_mensual_confirm(update: Update, context: ContextTy
         inquilinos_a_cobrar = cursor.fetchall()
     
     if not inquilinos_a_cobrar:
-        await query.edit_message_text(escape_markdown_v2("No se encontraron inquilinos con registro completo para generar el cobro en el alcance seleccionado."), reply_markup=teclado_admin_comunicacion(), parse_mode='MarkdownV2')
+        logger.info(f"No inquilinos encontrados para generar cobro mensual. Scope: {scope}, Target ID: {target_id}")
+        await query.edit_message_text(escape_markdown_v2("No se encontraron inquilinos con registro completo para generar el cobro en el alcance seleccionado. Asegúrate de que los inquilinos estén completamente registrados (con fecha de ingreso, monto de alquiler, etc.)."), reply_markup=teclado_admin_comunicacion(), parse_mode='MarkdownV2')
         return ConversationHandler.END
 
     cobros_generados = 0
@@ -2267,31 +2386,31 @@ async def admin_generar_cobro_mensual_confirm(update: Update, context: ContextTy
             detalle_cobro += "\n*Detalle de Servicios (Mes anterior):*\n"
             total_servicios_prorrateo = 0.0
 
-            # Prorrateo de Luz (kWh-based if individual meter, else included)
-            if medidor_luz_individual_id:
+            # Prorrateo de Luz (kWh-based if individual meter, else by people for shared light)
+            total_bill_luz_propiedad, total_kwh_propiedad = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'luz', current_year, current_month)
+            
+            costo_inquilino_luz = 0.0
+            if medidor_luz_individual_id: # Inquilino tiene medidor individual
                 current_reading = obtener_ultima_lectura(medidor_luz_individual_id)
                 previous_reading = obtener_lectura_anterior_mes(medidor_luz_individual_id, current_year, current_month)
                 tenant_kwh_consumed = current_reading - previous_reading
 
-                cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'luz' LIMIT 1", (propiedad_id,))
-                main_luz_medidor_info = cursor.fetchone()
-                
-                costo_inquilino_luz = 0.0
-                if main_luz_medidor_info:
-                    main_luz_medidor_id = main_luz_medidor_info[0]
-                    main_luz_bill, main_luz_kwh_total = obtener_facturas_por_medidor_y_mes(main_luz_medidor_id, current_year, current_month)
-
-                    if main_luz_kwh_total > 0:
-                        cost_per_kwh = main_luz_bill / main_luz_kwh_total
-                        costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
-                        detalle_cobro += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
-                    else:
-                        detalle_cobro += f"  - Luz: No se pudo calcular (kWh total de factura principal 0 o no disponible para medidor {main_luz_medidor_id}).\n"
+                if total_kwh_propiedad > 0:
+                    cost_per_kwh = total_bill_luz_propiedad / total_kwh_propiedad
+                    costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
+                    detalle_cobro += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
                 else:
-                    detalle_cobro += f"  - Luz: No se encontró medidor principal de luz para la propiedad {propiedad_id}.\n"
-                total_servicios_prorrateo += costo_inquilino_luz
-            else:
-                detalle_cobro += "  - Luz: Incluida en alquiler base (sin medidor individual asignado).\n"
+                    detalle_cobro += f"  - Luz: No se pudo calcular (kWh total de facturas de propiedad 0).\n"
+            else: # Inquilino prorratea luz por personas (sin medidor individual)
+                total_personas_shared_luz = obtener_inquilinos_prorrateo_compartido_luz(propiedad_id)
+                if total_personas_shared_luz > 0:
+                    costo_por_persona_luz = total_bill_luz_propiedad / total_personas_shared_luz
+                    costo_inquilino_luz = costo_por_persona_luz * num_personas_inquilino
+                    detalle_cobro += f"  - Luz (Compartida): {costo_inquilino_luz:.2f} Bs. (Total propiedad: {total_bill_luz_propiedad:.2f} Bs. / {total_personas_shared_luz} pers.)\n"
+                else:
+                    detalle_cobro += "  - Luz: No se pudo calcular (no hay personas para prorrateo de luz compartida).\n"
+            total_servicios_prorrateo += costo_inquilino_luz
+
 
             # Prorrateo de Agua (people-based)
             if medidor_agua_main_id:
@@ -2310,7 +2429,7 @@ async def admin_generar_cobro_mensual_confirm(update: Update, context: ContextTy
 
             # Prorrateo de Gas (people-based)
             if medidor_gas_main_id:
-                medidor_info = obtener_medidor_por_id(inquilino_data[10])
+                medidor_info = obtener_medidor_por_id(medidor_gas_main_id)
                 if medidor_info:
                     cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE medidor_asignado_gas_id = ?", (medidor_gas_main_id,))
                     total_personas_medidor_gas = cursor.fetchone()[0] or 1
@@ -2324,21 +2443,18 @@ async def admin_generar_cobro_mensual_confirm(update: Update, context: ContextTy
                 detalle_cobro += "  - Gas: Incluida en alquiler base (sin medidor principal asignado).\n"
 
             # Prorrateo de Internet/TV (people-based, for the property)
-            cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'internet_tv' LIMIT 1", (propiedad_id,))
-            main_internet_tv_medidor_info = cursor.fetchone()
+            total_internet_tv_bill_propiedad, _ = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'internet_tv', current_year, current_month)
             
             costo_inquilino_internet_tv = 0.0
-            if main_internet_tv_medidor_info:
-                main_internet_tv_medidor_id = main_internet_tv_medidor_info[0]
-                main_internet_tv_bill, _ = obtener_facturas_por_medidor_y_mes(main_internet_tv_medidor_id, current_year, current_month)
-                
-                cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
-                total_personas_propiedad = cursor.fetchone()[0] or 1
+            
+            cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
+            total_personas_propiedad = cursor.fetchone()[0] or 1
 
-                costo_por_persona_internet_tv = (main_internet_tv_bill / total_personas_propiedad) if total_personas_propiedad > 0 else 0
+            if total_personas_propiedad > 0:
+                costo_por_persona_internet_tv = (total_internet_tv_bill_propiedad / total_personas_propiedad) if total_personas_propiedad > 0 else 0
                 costo_inquilino_internet_tv = costo_por_persona_internet_tv * num_personas_inquilino
                 total_servicios_prorrateo += costo_inquilino_internet_tv
-                detalle_cobro += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {main_internet_tv_bill:.2f} Bs. / {total_personas_propiedad} pers.)\n"
+                detalle_cobro += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {total_internet_tv_bill_propiedad:.2f} Bs. / {total_personas_propiedad} pers.)\n"
             else:
                 detalle_cobro += "  - Internet/TV: No se encontró medidor principal de Internet/TV para la propiedad o no aplica.\n"
             
@@ -2364,7 +2480,20 @@ async def admin_generar_cobro_mensual_confirm(update: Update, context: ContextTy
         except Exception as e:
             logger.error(f"Error al enviar cobro mensual a {escape_markdown_v2(nombre_inquilino)} ({chat_id}): {e}")
     
-    await query.edit_message_text(escape_markdown_v2(f"Cobro mensual generado para {cobros_generados} inquilino(s)."), reply_markup=teclado_admin_comunicacion(), parse_mode='MarkdownV2')
+    if cobros_generados > 0:
+        await query.edit_message_text(
+            escape_markdown_v2(f"✅ Cobro mensual generado y enviado a *{cobros_generados} inquilino(s)*."),
+            reply_markup=teclado_admin_comunicacion(),
+            parse_mode='MarkdownV2'
+        )
+    else:
+        # This branch is reached if inquilinos_a_cobrar was not empty, but no messages were sent.
+        # This could happen if there were errors sending messages to all tenants.
+        await query.edit_message_text(
+            escape_markdown_v2("⚠️ No se pudo generar o enviar cobros a los inquilinos. Verifica los logs para más detalles. Asegúrate de que los inquilinos estén completamente registrados y que las facturas y lecturas estén al día."),
+            reply_markup=teclado_admin_comunicacion(),
+            parse_mode='MarkdownV2'
+        )
     return ConversationHandler.END
 
 # --- Handlers para inquilinos ---
@@ -2461,32 +2590,32 @@ async def ver_saldo_y_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_year = datetime.now().year
         current_month = datetime.now().month
 
-        # Prorrateo de Luz (kWh-based if individual meter, else included)
+        # Prorrateo de Luz
+        total_bill_luz_propiedad, total_kwh_propiedad = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'luz', current_year, current_month)
+        
+        costo_inquilino_luz = 0.0
         medidor_luz_individual_id = inquilino[8]
-        if medidor_luz_individual_id:
+        if medidor_luz_individual_id: # Inquilino tiene medidor individual
             current_reading = obtener_ultima_lectura(medidor_luz_individual_id)
             previous_reading = obtener_lectura_anterior_mes(medidor_luz_individual_id, current_year, current_month)
             tenant_kwh_consumed = current_reading - previous_reading
 
-            cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'luz' LIMIT 1", (propiedad_id,))
-            main_luz_medidor_info = cursor.fetchone()
-            
-            costo_inquilino_luz = 0.0
-            if main_luz_medidor_info:
-                main_luz_medidor_id = main_luz_medidor_info[0]
-                main_luz_bill, main_luz_kwh_total = obtener_facturas_por_medidor_y_mes(main_luz_medidor_id, current_year, current_month)
-
-                if main_luz_kwh_total > 0:
-                    cost_per_kwh = main_luz_bill / main_luz_kwh_total
-                    costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
-                    texto += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
-                else:
-                    texto += f"  - Luz: No se pudo calcular (kWh total de factura principal 0 o no disponible).\n"
+            if total_kwh_propiedad > 0:
+                cost_per_kwh = total_bill_luz_propiedad / total_kwh_propiedad
+                costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
+                texto += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
             else:
-                texto += f"  - Luz: No se encontró medidor principal de luz para la propiedad.\n"
-            total_servicios_prorrateo_estimado += costo_inquilino_luz
+                texto += f"  - Luz: No se pudo calcular (kWh total de facturas de propiedad 0).\n"
         else:
-            texto += "  - Luz: Incluida en alquiler base (sin medidor individual asignado).\n"
+            total_personas_shared_luz = obtener_inquilinos_prorrateo_compartido_luz(propiedad_id)
+            if total_personas_shared_luz > 0:
+                costo_por_persona_luz = total_bill_luz_propiedad / total_personas_shared_luz
+                costo_inquilino_luz = costo_por_persona_luz * num_personas_inquilino
+                texto += f"  - Luz (Compartida): {costo_inquilino_luz:.2f} Bs. (Total propiedad: {total_bill_luz_propiedad:.2f} Bs. / {total_personas_shared_luz} pers.)\n"
+            else:
+                texto += "  - Luz: No se pudo calcular (no hay personas para prorrateo de luz compartida).\n"
+        total_servicios_prorrateo_estimado += costo_inquilino_luz
+
 
         # Prorrateo de Agua (people-based)
         medidor_agua_main_id = inquilino[9]
@@ -2507,7 +2636,7 @@ async def ver_saldo_y_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Prorrateo de Gas (people-based)
         medidor_gas_main_id = inquilino[10]
         if medidor_gas_main_id:
-            medidor_info = obtener_medidor_por_id(inquilino[10])
+            medidor_info = obtener_medidor_por_id(medidor_gas_main_id)
             if medidor_info:
                 cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE medidor_asignado_gas_id = ?", (medidor_gas_main_id,))
                 total_personas_medidor_gas = cursor.fetchone()[0] or 1
@@ -2521,21 +2650,18 @@ async def ver_saldo_y_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texto += "  - Gas: Incluida en alquiler base (sin medidor principal asignado).\n"
 
         # Prorrateo de Internet/TV (people-based, for the property)
-        cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'internet_tv' LIMIT 1", (propiedad_id,))
-        main_internet_tv_medidor_info = cursor.fetchone()
+        total_internet_tv_bill_propiedad, _ = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'internet_tv', current_year, current_month)
         
         costo_inquilino_internet_tv = 0.0
-        if main_internet_tv_medidor_info:
-            main_internet_tv_medidor_id = main_internet_tv_medidor_info[0]
-            main_internet_tv_bill, _ = obtener_facturas_por_medidor_y_mes(main_internet_tv_medidor_id, current_year, current_month)
-            
-            cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
-            total_personas_propiedad = cursor.fetchone()[0] or 1
+        
+        cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
+        total_personas_propiedad = cursor.fetchone()[0] or 1
 
-            costo_por_persona_internet_tv = (main_internet_tv_bill / total_personas_propiedad) if total_personas_propiedad > 0 else 0
+        if total_personas_propiedad > 0:
+            costo_por_persona_internet_tv = (total_internet_tv_bill_propiedad / total_personas_propiedad) if total_personas_propiedad > 0 else 0
             costo_inquilino_internet_tv = costo_por_persona_internet_tv * num_personas_inquilino
             total_servicios_prorrateo_estimado += costo_inquilino_internet_tv
-            texto += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {main_internet_tv_bill:.2f} Bs. / {total_personas_propiedad} pers.)\n"
+            texto += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {total_internet_tv_bill_propiedad:.2f} Bs. / {total_personas_propiedad} pers.)\n"
         else:
             texto += "  - Internet/TV: No se encontró medidor principal de Internet/TV para la propiedad o no aplica.\n"
 
@@ -2577,22 +2703,21 @@ async def handle_queja_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
 async def inq_enviar_queja(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe la queja/sugerencia del inquilino y la registra."""
+    """Recibe la queja/sugerencia del inquilino y la registra (solo texto)."""
     chat_id = update.effective_chat.id
     texto_queja = update.message.text.strip()
+
     if not texto_queja:
         await update.message.reply_text(escape_markdown_v2("La queja no puede estar vacía. Por favor, escribe tu queja o sugerencia:"),
                                         reply_markup=boton_volver_menu('inquilino'), parse_mode='MarkdownV2')
         return INQ_ENVIAR_QUEJA
 
-    # Registrar la queja y obtener su ID
-    cursor.execute(
-        "INSERT INTO quejas(chat_id, fecha, texto, resuelto) VALUES (?, ?, ?, 0)",
-        (chat_id, datetime.now().strftime("%Y-%m-%d %H:%M"), texto_queja)
-    )
-    conn.commit()
-    queja_id = cursor.lastrowid # Obtener el ID de la queja recién insertada
-    logger.info(f"Queja registrada de {chat_id}: {texto_queja}. Queja ID: {queja_id}")
+    # Register the complaint (text only for now in DB)
+    registrar_queja(chat_id, texto_queja)
+    
+    # Get the ID of the newly inserted complaint to use in the admin notification button
+    cursor.execute("SELECT id FROM quejas WHERE chat_id = ? ORDER BY fecha DESC LIMIT 1", (chat_id,))
+    queja_id = cursor.fetchone()[0]
 
     await update.message.reply_text(
         escape_markdown_v2("Gracias, tu queja/sugerencia ha sido enviada a la administración."),
@@ -2604,20 +2729,22 @@ async def inq_enviar_queja(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inquilino_info = obtener_inquilino(chat_id)
             inquilino_nombre = inquilino_info[1] if inquilino_info else chat_id
             
-            # Botón para marcar como resuelta directamente
+            # Botón para marcar como resuelta directamente - NUEVO CALLBACK DATA
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Marcar como Resuelta", callback_data=f"markqueja_{queja_id}")]
+                [InlineKeyboardButton("✅ Marcar como Resuelta Directo", callback_data=f"resolve_queja_direct_{queja_id}")]
             ])
+
+            admin_message_text = escape_markdown_v2(f"🔔 *Nueva queja/sugerencia de:*\n"
+                                 f"*Inquilino:* {escape_markdown_v2(inquilino_nombre)} (ID: {chat_id})\n"
+                                 f"*Mensaje:* {escape_markdown_v2(texto_queja)}\n")
 
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=escape_markdown_v2(f"🔔 *Nueva queja/sugerencia de:*\n"
-                     f"*Inquilino:* {escape_markdown_v2(inquilino_nombre)} (ID: {chat_id})\n"
-                     f"*Mensaje:* {escape_markdown_v2(texto_queja)}\n"
-                     f"Usa el menú de administrador para leerla y marcarla como resuelta."),
-                reply_markup=keyboard, # Añadir el botón al mensaje
+                text=admin_message_text,
+                reply_markup=keyboard,
                 parse_mode='MarkdownV2'
             )
+            logger.info(f"Admin {admin_id} notificado sobre nueva queja de {inquilino_nombre}.")
         except Exception as e:
             logger.error(f"Error al notificar al admin {admin_id} sobre nueva queja: {e}")
     return ConversationHandler.END
@@ -2684,7 +2811,7 @@ async def admin_show_accounting_summary(update: Update, context: ContextTypes.DE
 # --- Handlers para mostrar información (sin iniciar conversación) ---
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja las interacciones de los botones inline de los menús que solo muestran información o navegan entre menús."""
+    """Maneja las interacciones de los botones inline de los menús que solo muestran información o navegan entre submenús."""
     query = update.callback_query
     await query.answer()
 
@@ -2693,9 +2820,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat_id in ADMIN_IDS:
         # --- Opciones administrador ---
-        if target_menu_data == 'menu_admin':
-            await query.edit_message_text(escape_markdown_v2("Panel administrador:"), reply_markup=teclado_admin(), parse_mode='MarkdownV2')
-        elif target_menu_data == 'admin_menu_inquilinos':
+        if target_menu_data == 'admin_menu_inquilinos':
             await query.edit_message_text(escape_markdown_v2("Menú de Gestión de Inquilinos:"), reply_markup=teclado_admin_inquilinos(), parse_mode='MarkdownV2')
         elif target_menu_data == 'admin_menu_facturacion':
             await query.edit_message_text(escape_markdown_v2("Menú de Facturación y Medidores:"), reply_markup=teclado_admin_facturacion(), parse_mode='MarkdownV2')
@@ -2808,18 +2933,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(escape_markdown_v2("Opción no reconocida para administrador."), reply_markup=teclado_admin(), parse_mode='MarkdownV2')
     else:
         # --- Opciones inquilino ---
-        if target_menu_data == 'menu_inquilino':
-            inquilino = obtener_inquilino(chat_id)
-            if inquilino and inquilino[3] is not None:
-                await query.edit_message_text(
-                    escape_markdown_v2("Menú inquilino:"), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2'
-                )
-            else:
-                await query.edit_message_text(
-                    escape_markdown_v2("Tu registro está pendiente de validación por el administrador. Usa /start para verificar tu estado."),
-                    parse_mode='MarkdownV2'
-                )
-        elif target_menu_data == 'ver_saldo':
+        if target_menu_data == 'ver_saldo':
             inquilino = obtener_inquilino(chat_id)
 
             if not inquilino:
@@ -2853,32 +2967,34 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current_year = datetime.now().year
                 current_month = datetime.now().month
 
+                # Prorrateo de Luz
+                total_bill_luz_propiedad, total_kwh_propiedad = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'luz', current_year, current_month)
+                
+                costo_inquilino_luz = 0.0
                 medidor_luz_individual_id = inquilino[8]
-                if medidor_luz_individual_id:
+                if medidor_luz_individual_id: # Inquilino tiene medidor individual
                     current_reading = obtener_ultima_lectura(medidor_luz_individual_id)
                     previous_reading = obtener_lectura_anterior_mes(medidor_luz_individual_id, current_year, current_month)
                     tenant_kwh_consumed = current_reading - previous_reading
 
-                    cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'luz' LIMIT 1", (propiedad_id,))
-                    main_luz_medidor_info = cursor.fetchone()
-                    
-                    costo_inquilino_luz = 0.0
-                    if main_luz_medidor_info:
-                        main_luz_medidor_id = main_luz_medidor_info[0]
-                        main_luz_bill, main_luz_kwh_total = obtener_facturas_por_medidor_y_mes(main_luz_medidor_id, current_year, current_month)
-
-                        if main_luz_kwh_total > 0:
-                            cost_per_kwh = main_luz_bill / main_luz_kwh_total
-                            costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
-                            texto += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
-                        else:
-                            texto += f"  - Luz: No se pudo calcular (kWh total de factura principal 0 o no disponible).\n"
+                    if total_kwh_propiedad > 0:
+                        cost_per_kwh = total_bill_luz_propiedad / total_kwh_propiedad
+                        costo_inquilino_luz = cost_per_kwh * tenant_kwh_consumed
+                        texto += f"  - Luz (Consumo: {tenant_kwh_consumed:.2f} kWh): {costo_inquilino_luz:.2f} Bs. (Tarifa: {cost_per_kwh:.2f} Bs/kWh)\n"
                     else:
-                        texto += f"  - Luz: No se encontró medidor principal de luz para la propiedad.\n"
-                    total_servicios_prorrateo_estimado += costo_inquilino_luz
+                        texto += f"  - Luz: No se pudo calcular (kWh total de facturas de propiedad 0).\n"
                 else:
-                    texto += "  - Luz: Incluida en alquiler base (sin medidor individual asignado).\n"
+                    total_personas_shared_luz = obtener_inquilinos_prorrateo_compartido_luz(propiedad_id)
+                    if total_personas_shared_luz > 0:
+                        costo_por_persona_luz = total_bill_luz_propiedad / total_personas_shared_luz
+                        costo_inquilino_luz = costo_por_persona_luz * num_personas_inquilino
+                        texto += f"  - Luz (Compartida): {costo_inquilino_luz:.2f} Bs. (Total propiedad: {total_bill_luz_propiedad:.2f} Bs. / {total_personas_shared_luz} pers.)\n"
+                    else:
+                        texto += "  - Luz: No se pudo calcular (no hay personas para prorrateo de luz compartida).\n"
+                total_servicios_prorrateo_estimado += costo_inquilino_luz
 
+
+                # Prorrateo de Agua (people-based)
                 medidor_agua_main_id = inquilino[9]
                 if medidor_agua_main_id:
                     medidor_info = obtener_medidor_por_id(medidor_agua_main_id)
@@ -2894,9 +3010,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     texto += "  - Agua: Incluida en alquiler base (sin medidor principal asignado).\n"
 
+                # Prorrateo de Gas (people-based)
                 medidor_gas_main_id = inquilino[10]
                 if medidor_gas_main_id:
-                    medidor_info = obtener_medidor_por_id(inquilino[10])
+                    medidor_info = obtener_medidor_por_id(medidor_gas_main_id)
                     if medidor_info:
                         cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE medidor_asignado_gas_id = ?", (medidor_gas_main_id,))
                         total_personas_medidor_gas = cursor.fetchone()[0] or 1
@@ -2909,21 +3026,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     texto += "  - Gas: Incluida en alquiler base (sin medidor principal asignado).\n"
 
-                cursor.execute("SELECT id FROM medidores WHERE propiedad_id = ? AND tipo_servicio = 'internet_tv' LIMIT 1", (propiedad_id,))
-                main_internet_tv_medidor_info = cursor.fetchone()
+                # Prorrateo de Internet/TV (people-based, for the property)
+                total_internet_tv_bill_propiedad, _ = obtener_facturas_por_propiedad_servicio_y_mes(propiedad_id, 'internet_tv', current_year, current_month)
                 
                 costo_inquilino_internet_tv = 0.0
-                if main_internet_tv_medidor_info:
-                    main_internet_tv_medidor_id = main_internet_tv_medidor_info[0]
-                    main_internet_tv_bill, _ = obtener_facturas_por_medidor_y_mes(main_internet_tv_medidor_id, current_year, current_month)
-                    
-                    cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
-                    total_personas_propiedad = cursor.fetchone()[0] or 1
+                
+                cursor.execute("SELECT SUM(num_personas) FROM inquilinos WHERE propiedad_id = ?", (propiedad_id,))
+                total_personas_propiedad = cursor.fetchone()[0] or 1
 
-                    costo_por_persona_internet_tv = (main_internet_tv_bill / total_personas_propiedad) if total_personas_propiedad > 0 else 0
+                if total_personas_propiedad > 0:
+                    costo_por_persona_internet_tv = (total_internet_tv_bill_propiedad / total_personas_propiedad) if total_personas_propiedad > 0 else 0
                     costo_inquilino_internet_tv = costo_por_persona_internet_tv * num_personas_inquilino
                     total_servicios_prorrateo_estimado += costo_inquilino_internet_tv
-                    texto += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {main_internet_tv_bill:.2f} Bs. / {total_personas_propiedad} pers.)\n"
+                    texto += f"  - Internet/TV: {costo_inquilino_internet_tv:.2f} Bs. (Total propiedad: {total_internet_tv_bill_propiedad:.2f} Bs. / {total_personas_propiedad} pers.))\n"
                 else:
                     texto += "  - Internet/TV: No se encontró medidor principal de Internet/TV para la propiedad o no aplica.\n"
 
@@ -2931,6 +3046,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 texto += f"\nTotal mensual estimado (Alquiler + Servicios): *{(monto_alquiler + total_servicios_prorrateo_estimado):.2f} Bs.*"
                 texto += "\n\n"
 
+            # Historial de pagos
             cursor.execute("SELECT fecha_pago, monto_pagado, confirmado FROM pagos WHERE chat_id = ? ORDER BY fecha_pago DESC LIMIT 5", (chat_id,))
             pagos_recientes = cursor.fetchall()
             if pagos_recientes:
@@ -2941,7 +3057,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 texto += "No hay pagos registrados.\n"
 
-            await query.edit_message_text(escape_markdown_v2(texto), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2')
+            await query.edit_message_text(escape_markdown_v2(texto), reply_markup=boton_volver_menu('inquilino'), parse_mode='MarkdownV2')
 
         elif target_menu_data == 'ver_mi_propiedad':
             inquilino = obtener_inquilino(chat_id)
@@ -3006,12 +3122,30 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id in ADMIN_IDS:
             await message_to_edit.edit_text(escape_markdown_v2("Operación cancelada."), reply_markup=teclado_admin(), parse_mode='MarkdownV2')
         else:
-            await message_to_edit.edit_text(escape_markdown_v2("Operación cancelada."), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2')
+            # Para inquilinos, si cancelan, deben volver a su estado normal (sin menú si no están registrados)
+            inquilino = obtener_inquilino(chat_id)
+            if inquilino and inquilino[3] is not None: # Si está completamente registrado
+                await message_to_edit.edit_text(escape_markdown_v2("Operación cancelada."), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2')
+            else: # Si no está registrado o está pendiente
+                await message_to_edit.edit_text(
+                    escape_markdown_v2("Operación cancelada. Tu registro está pendiente de validación por el administrador."),
+                    parse_mode='MarkdownV2',
+                    reply_markup=None
+                )
     else:
         if chat_id in ADMIN_IDS:
             await context.bot.send_message(chat_id=chat_id, text=escape_markdown_v2("Operación cancelada."), reply_markup=teclado_admin(), parse_mode='MarkdownV2')
         else:
-            await context.bot.send_message(chat_id=chat_id, text=escape_markdown_v2("Operación cancelada."), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2')
+            inquilino = obtener_inquilino(chat_id)
+            if inquilino and inquilino[3] is not None:
+                await context.bot.send_message(chat_id=chat_id, text=escape_markdown_v2("Operación cancelada."), reply_markup=teclado_inquilino(), parse_mode='MarkdownV2')
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=escape_markdown_v2("Operación cancelada. Tu registro está pendiente de validación por el administrador."),
+                    parse_mode='MarkdownV2',
+                    reply_markup=None
+                )
             
     return ConversationHandler.END
 
@@ -3044,12 +3178,13 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(handle_admin_del_propiedad_callback, pattern='^admin_del_propiedad$'),
         CallbackQueryHandler(handle_admin_add_medidor_callback, pattern='^admin_add_medidor$'),
         CallbackQueryHandler(handle_admin_send_notice_callback, pattern='^admin_send_notice$'),
-        CallbackQueryHandler(handle_admin_confirmar_pagos_callback, pattern='^admin_confirmar_pagos$'),
+        CallbackQueryHandler(handle_admin_confirmar_pagos_callback, pattern='^admin_confirmar_pagos$'), # Movido a entry_points
         CallbackQueryHandler(handle_admin_quejas_callback, pattern='^admin_quejas$'),
         CallbackQueryHandler(handle_admin_generar_cobro_mensual_callback, pattern='^admin_generar_cobro_mensual$'),
         CallbackQueryHandler(admin_show_accounting_summary, pattern='^admin_resumen_contable$'),
         CallbackQueryHandler(handle_admin_modificar_propiedad_callback, pattern='^admin_modificar_propiedad$'), # Nuevo handler
 
+        # Handlers que solo muestran información y no inician una conversación de múltiples pasos
         CallbackQueryHandler(menu_callback, pattern='^admin_morosos$'),
         CallbackQueryHandler(admin_ver_propiedades_callback, pattern='^admin_ver_propiedades$'),
     ],
@@ -3070,6 +3205,7 @@ conv_handler = ConversationHandler(
         INQ_AMORTIZAR_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, inq_amortizar_monto)],
         INQ_AMORTIZAR_COMPROBANTE: [MessageHandler(filters.PHOTO & ~filters.COMMAND, inq_amortizar_comprobante)],
 
+        # CORRECCIÓN: Se revierte a solo texto para quejas/sugerencias
         INQ_ENVIAR_QUEJA: [MessageHandler(filters.TEXT & ~filters.COMMAND, inq_enviar_queja)],
 
         ADMIN_REG_FACTURA_PROPIEDAD: [CallbackQueryHandler(admin_reg_factura_propiedad, pattern='^factprop_')],
@@ -3084,6 +3220,7 @@ conv_handler = ConversationHandler(
         ADMIN_REG_LECTURA_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reg_lectura_valor)],
 
         NOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, obtener_nombre_manual)],
+        REGISTRAR_CI: [MessageHandler(filters.TEXT & ~filters.COMMAND, obtener_chat_id_manual)], # Reutilizamos este estado para el chat_id manual
 
         ADMIN_ELIMINAR_INQUILINO_SELECT: [CallbackQueryHandler(admin_eliminar_inquilino_select, pattern='^delinqui_')],
         ADMIN_ELIMINAR_INQUILINO_CONFIRM: [CallbackQueryHandler(admin_eliminar_inquilino_confirm, pattern='^(confirm_del_inquilino|cancel_del_inquilino)$')],
@@ -3121,10 +3258,10 @@ conv_handler = ConversationHandler(
         ADMIN_SEND_NOTICE_INQUILINO_SELECT: [CallbackQueryHandler(admin_send_notice_inquilino_select, pattern='^noticeinq_')],
         ADMIN_SEND_NOTICE_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_notice_message)],
 
-        ADMIN_CONFIRM_PAGO_SELECT: [CallbackQueryHandler(admin_confirm_pago_select, pattern='^confirmpago_')],
+        ADMIN_CONFIRM_PAGO_SELECT: [CallbackQueryHandler(admin_confirm_pago_select, pattern='^confirmpago_')], # Se mantiene aquí para el flujo del menú
         ADMIN_CONFIRM_PAGO_CONFIRM: [CallbackQueryHandler(admin_confirm_pago_confirm, pattern='^(confirm_pago_yes|confirm_pago_no)$')],
 
-        ADMIN_MARK_QUEJA_RESOLVED_SELECT: [CallbackQueryHandler(admin_mark_queja_resolved_select, pattern='^markqueja_')],
+        ADMIN_MARK_QUEJA_RESOLVED_SELECT: [CallbackQueryHandler(admin_mark_queja_resolved_select, pattern='^markqueja_')], # Se mantiene aquí para el flujo del menú
         ADMIN_MARK_QUEJA_RESOLVED_CONFIRM: [CallbackQueryHandler(admin_mark_queja_resolved_confirm, pattern='^(confirm_resolve_queja|cancel_resolve_queja)$')],
 
         ADMIN_MODIFICAR_INQUILINO_SELECT: [CallbackQueryHandler(admin_modificar_inquilino_select, pattern='^modinq_')],
@@ -3139,35 +3276,84 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[
         CommandHandler('cancelar', cancelar),
-        CallbackQueryHandler(menu_callback, pattern='^(menu_admin|menu_inquilino|admin_menu_inquilinos|admin_menu_facturacion|admin_menu_comunicacion|admin_gestionar_propiedades|admin_modificar_inquilino|admin_morosos|admin_ver_propiedades|admin_resumen_contable|ver_saldo|ver_mi_propiedad)$')
+        # Los botones de "Volver al menú principal" ahora van directamente al start handler
+        CallbackQueryHandler(start, pattern='^(menu_admin|menu_inquilino)$'),
+        # Los botones de "Volver a submenús" siguen siendo manejados por menu_callback
+        CallbackQueryHandler(menu_callback, pattern='^(admin_menu_inquilinos|admin_menu_facturacion|admin_menu_comunicacion|admin_gestionar_propiedades|admin_modificar_inquilino|admin_morosos|admin_ver_propiedades|admin_resumen_contable|ver_saldo|ver_mi_propiedad)$')
     ],
     allow_reentry=True
 )
 
+# --- Configuración de los handlers de la aplicación de Telegram ---
+application = ApplicationBuilder().token(TOKEN).build()
+application.add_handler(conv_handler)
+application.add_handler(CallbackQueryHandler(admin_confirm_payment_direct, pattern='^confirm_payment_direct_'))
+application.add_handler(CallbackQueryHandler(admin_resolve_queja_direct, pattern='^resolve_queja_direct_'))
+
+# --- Funciones para webhooks ---
+async def setup_webhook():
+    """Configura el webhook para el bot."""
+    # La URL de tu servicio en Render.com será algo como https://your-service-name.onrender.com
+    # Render.com expone el puerto 80 por defecto, pero el PORT de la variable de entorno es para Flask
+    # La URL base será proporcionada por Render.com en la variable de entorno RENDER_EXTERNAL_HOSTNAME
+    external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not external_hostname:
+        logger.error("RENDER_EXTERNAL_HOSTNAME no está configurado. No se puede establecer el webhook.")
+        return
+
+    webhook_url = f"https://{external_hostname}{WEBHOOK_PATH}"
+    await application.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook establecido en: {webhook_url}")
+
+@app.route(WEBHOOK_PATH, methods=['POST'])
+async def telegram_webhook():
+    """Maneja las actualizaciones de Telegram recibidas por el webhook."""
+    # Asegúrate de que la aplicación de Telegram esté inicializada antes de procesar la actualización
+    if not application.updater:
+        logger.error("Application updater not initialized.")
+        return "Internal Server Error", 500
+
+    update_json = request.get_json(force=True)
+    update = Update.de_json(update_json, application.bot)
+    
+    # Procesar la actualización en un hilo separado o de forma asíncrona
+    # Esto es crucial para no bloquear el webhook y evitar timeouts de Telegram
+    await application.process_update(update)
+    return "ok"
+
+@app.route('/')
+def index():
+    """Ruta de inicio para verificar que el servicio está corriendo."""
+    return "Bot de Telegram activo y esperando webhooks."
+
 # --- Configuración de comandos persistentes del bot ---
-async def set_default_commands(application):
+async def set_default_commands(application_instance):
     """Establece los comandos por defecto para el bot (botón de menú)."""
     commands = [
         BotCommand("start", "Iniciar o ir al menú principal"),
         BotCommand("cancelar", "Cancelar operación actual"),
     ]
-    await application.bot.set_my_commands(commands)
+    await application_instance.bot.set_my_commands(commands)
     logger.info("Comandos por defecto del bot configurados.")
 
-# --- Función principal ---
-
-def main():
-    """Función principal para iniciar el bot."""
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Configurar los comandos persistentes del bot
-    application.job_queue.run_once(set_default_commands, 0, name="set_default_commands")
-
-    # Añadir handlers
-    application.add_handler(conv_handler)
-
-    logger.info("Bot corriendo...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# --- Punto de entrada para Gunicorn y ejecución local ---
 if __name__ == '__main__':
-    main()
+    # Esto se ejecuta cuando el script se corre directamente (ej. python bot.py)
+    # Es útil para pruebas locales usando polling.
+    logger.info("Ejecutando bot localmente (polling)...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+else:
+    # Esto se ejecuta cuando Gunicorn importa el módulo 'bot'
+    # Configura el webhook y los comandos al inicio del servicio en Render.
+    # Gunicorn se encargará de levantar el servidor Flask (la variable 'app').
+    logger.info("Configurando bot para despliegue en Render (webhooks)...")
+    
+    # Ejecuta las funciones asíncronas para configurar el webhook y comandos
+    # Esto es necesario porque estas funciones son 'async' pero se llaman
+    # en un contexto síncrono (cuando Gunicorn importa el módulo).
+    asyncio.run(set_default_commands(application))
+    asyncio.run(setup_webhook())
+
+    # La instancia de Flask 'app' ya está definida globalmente.
+    # Gunicorn la encontrará y la ejecutará.
+    # No es necesario llamar a app.run() aquí.
